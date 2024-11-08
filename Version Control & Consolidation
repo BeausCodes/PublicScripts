@@ -1,19 +1,23 @@
+#Variables
+$ClientName = 'ClientName'
+$SiteName = 'SiteName'
+
 # Run this to enable version expiration settings
 Set-SPOTenant -EnableVersionExpirationSetting $true
 
 # get the current version limits for entire site
-Get-SPOListVersionPolicy -site https://CLIENTNAME.sharepoint.com/sites/SITENAME
+Get-SPOListVersionPolicy -site "https://$($ClientName).sharepoint.com/sites/$($SiteName)"
 
 # Enable version control limits and set expiry to 0 days 10 version 
 # You can run Set-SPOSite -Identity SiteURL -EnableAutoExpirationVersionTrim $true to have sharepoint auto manage but is not recommended
 # Append -ApplyToNewDocumentLibraries to apply only to new document librarys
-Set-SPOSite -Identity https://CLIENTNAME.sharepoint.com/sites/SITENAME -EnableAutoExpirationVersionTrim $false -MajorVersionLimit 10 -MajorwithMinorVersionsLimit 1 -ExpireVersionsAfterDays 0
+Set-SPOSite -Identity "https://$($ClientName).sharepoint.com/sites/$($SiteName)" -EnableAutoExpirationVersionTrim $false -MajorVersionLimit 10 -MajorwithMinorVersionsLimit 1 -ExpireVersionsAfterDays 0
 
 # Cleans up any versions past the limits specified in the batch job
-New-SPOSiteFileVersionBatchDeleteJob -Identity https://CLIENTNAME.sharepoint.com/sites/SITENAME -MajorVersionLimit 10 -MajorWithMinorVersionsLimit 1
+New-SPOSiteFileVersionBatchDeleteJob -Identity "https://$($ClientName).sharepoint.com/sites/$($SiteName)" -MajorVersionLimit 10 -MajorWithMinorVersionsLimit 1
 
 # Cleans up any versions past the limits for a specific library
-New-SPOListFileVersionBatchDeleteJob -Site https://CLIENTNAME.sharepoint.com/sites/SITENAME -list LibraryName -MajorVersionLimit <delete major versions exceeding limit> -MajorWithMinorVersionsLimit <delete minor versions exceeding limit>
+New-SPOListFileVersionBatchDeleteJob -Site "https://$($ClientName).sharepoint.com/sites/$($SiteName)" -list LibraryName -MajorVersionLimit <delete major versions exceeding limit> -MajorWithMinorVersionsLimit <delete minor versions exceeding limit>
 
 # Check on status of job
-Get-SPOSiteFileVersionBatchDeleteJobProgress -Identity https://CLIENTNAME.sharepoint.com/sites/SITENAME
+Get-SPOSiteFileVersionBatchDeleteJobProgress -Identity "https://$($ClientName).sharepoint.com/sites/$($SiteName)"
