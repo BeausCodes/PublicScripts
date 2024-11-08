@@ -17,3 +17,33 @@ New-SPOListFileVersionBatchDeleteJob -Site https://CLIENTNAME.sharepoint.com/sit
 
 # Check on status of job
 Get-SPOSiteFileVersionBatchDeleteJobProgress -Identity https://CLIENTNAME.sharepoint.com/sites/SITENAME
+
+
+
+
+
+# Connect to SharePoint Online
+Connect-SPOService -Url https://YOURTENANT-admin.sharepoint.com
+
+# Get all site collections
+$sites = Get-SPOSite -Limit All
+
+# Loop through each site and create a batch delete job
+foreach ($site in $sites) {
+    Write-Host "Processing site: $($site.Url)"
+    
+    try {
+        # Replace 'LibraryName' with the actual name of the document library for each site
+        $libraryName = "LibraryName"
+
+        # Create a batch delete job for each site
+        New-SPOListFileVersionBatchDeleteJob -Site $site.Url -List $libraryName -MajorVersionLimit 250 -MajorWithMinorVersionsLimit 1
+
+        Write-Host "Batch delete job created for: $($site.Url)"
+    }
+    catch {
+        Write-Host "Error processing site: $($site.Url) - $_"
+    }
+}
+
+Write-Host "Script completed."
