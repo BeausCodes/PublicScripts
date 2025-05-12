@@ -1,3 +1,5 @@
+To Run the below commands you will need the Sharepoint Online management shell installed (LATEST VERSION)
+
 # Run this to enable version expiration settings
 Set-SPOTenant -EnableVersionExpirationSetting $true
 
