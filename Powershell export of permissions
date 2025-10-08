@@ -1,0 +1,185 @@
+param(
+  [Parameter(Mandatory=$true)] [string]$SiteUrl,
+  [Parameter(Mandatory=$true)] [string]$LibraryTitle,   # e.g. "Documents" or "Shared Documents"
+  [string]$OutCsv = "$PWD\SP_FolderAndUniqueFilePerms_$(Get-Date -f 'yyyyMMdd_HHmmss').csv",
+  [string]$StartFolder = "",
+  [int]$MaxDepth = 5,                                   # 0 = unlimited
+  [int]$MaxRows = 200000,                               # safety cap
+  [int]$Concurrency = 8,                                # parallel permission requests
+  [switch]$Quiet                                        # suppress progress logs
+)
+
+# ---- must be connected already ----
+try { Get-MgContext | Out-Null } catch { throw "Not connected. Run Connect-MgGraph -UseDeviceCode -Scopes 'Sites.Read.All' first." }
+
+# ---- helpers ----
+$script:_rows = 0
+function Log($m){ if(-not $Quiet){ Write-Host "[$(Get-Date -f HH:mm:ss)] $m" -ForegroundColor DarkCyan } }
+
+function Get-GraphJson([Parameter(Mandatory)][string]$Uri){
+  $attempt=0
+  while($true){
+    try{ return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop }
+    catch{
+      $attempt++
+      if($attempt -ge 5){ throw }
+      Start-Sleep -Seconds ([Math]::Min(30, 2*$attempt))
+    }
+  }
+}
+function Get-AllPages([Parameter(Mandatory)][string]$Uri){
+  $all=@(); $next=$Uri
+  while($next){
+    $resp = Get-GraphJson $next
+    if($resp.value){ $all += $resp.value }
+    $next = $resp.'@odata.nextLink'
+  }
+  $all
+}
+
+# quick probe
+Get-GraphJson "/v1.0/sites/root" | Out-Null
+
+# ---- resolve site (root-safe) ----
+$u        = [Uri]$SiteUrl
+$spHost   = $u.Host
+$sitePath = if ([string]::IsNullOrWhiteSpace($u.AbsolutePath)) { "/" } else { $u.AbsolutePath }
+$site     = Get-GraphJson ("/v1.0/sites/{0}:{1}" -f $spHost, $sitePath)
+if(-not $site.id){ throw "Could not resolve site from $SiteUrl" }
+Log ("Site: {0}" -f $site.id)
+
+# ---- resolve drive (library) ----
+$drives = Get-AllPages ("/v1.0/sites/{0}/drives" -f $site.id)
+$drive  = $drives | Where-Object { $_.name -eq $LibraryTitle } | Select-Object -First 1
+if(-not $drive){
+  $names = ($drives | Select-Object -ExpandProperty name) -join ', '
+  throw ("Library '{0}' not found at {1}. Available: {2}" -f $LibraryTitle,$SiteUrl,$names)
+}
+Log ("Library: {0} ({1})" -f $drive.name,$drive.id)
+
+# ---- locate start item (root or subfolder) ----
+$rootItem = Get-GraphJson ("/v1.0/drives/{0}/root?`$select=id,name,parentReference" -f $drive.id)
+$startId  = $rootItem.id
+$startLbl = "/"
+if ($StartFolder -and $StartFolder.Trim() -ne ""){
+  if (-not $StartFolder.StartsWith("/")) { $StartFolder = "/$StartFolder" }
+  $sf = $null
+  $sfPath = ("/v1.0/drives/{0}/root:{1}:" -f $drive.id, $StartFolder)
+  try { $sf = Get-GraphJson $sfPath } catch {}
+  if(-not $sf -or -not $sf.id){ throw ("StartFolder '{0}' not found in '{1}'." -f $StartFolder,$drive.name) }
+  $startId=$sf.id; $startLbl=$StartFolder
+  Log ("Start folder: {0}" -f $StartFolder)
+} else {
+  Log "Start at drive root"
+}
+
+# ---- 1) Crawl to COLLECT items (no permissions yet) ----
+# We collect minimal shape: id, name, type, path. Later we fetch perms in parallel.
+$items = New-Object System.Collections.Generic.List[object]
+
+function Enqueue([object]$it){
+  $prefix = $it.parentReference.path.Replace('/drive/root:', '')
+  $path   = if([string]::IsNullOrWhiteSpace($prefix)){ "/$($it.name)" } else { "$prefix/$($it.name)" }
+  $type   = if($it.folder){ 'Folder' } else { 'File' }
+  $items.Add([pscustomobject]@{ Id=$it.id; Path=$path; Type=$type })
+}
+
+function Walk([string]$ParentId,[int]$Depth){
+  $kids = Get-AllPages ("/v1.0/drives/{0}/items/{1}/children?`$select=id,name,folder,file,parentReference&`$top=200" -f $drive.id, $ParentId)
+  foreach($k in $kids){ Enqueue $k }
+  if ($MaxDepth -eq 0 -or $Depth -lt $MaxDepth){
+    foreach($folder in ($kids | Where-Object { $_.folder })){
+      Walk -ParentId $folder.id -Depth ($Depth+1)
+    }
+  }
+}
+
+Log ("Collecting items… (MaxDepth={0})" -f $MaxDepth)
+Walk -ParentId $startId -Depth 1
+Log ("Collected {0} items" -f $items.Count)
+
+# ---- 2) Fetch permissions IN PARALLEL ----
+#   Rules:
+#   - Always output rows for FOLDERS (even if inherited)
+#   - Output FILE rows ONLY if explicit perms exist
+$rows = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+$throttle = [Math]::Max(1, [Math]::Min($Concurrency, 32))
+Log ("Fetching permissions in parallel (Concurrency={0})…" -f $throttle)
+
+$items | ForEach-Object -Parallel {
+  param($driveId, $siteUrl, $libraryTitle, $maxRows)
+  # local helpers (no logs in parallel)
+  function GetJson($uri){
+    $attempt=0
+    while($true){
+      try{ return Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop }
+      catch{
+        $attempt++; if($attempt -ge 5){ throw }
+        Start-Sleep -Seconds ([Math]::Min(30, 2*$attempt))
+      }
+    }
+  }
+  function GetAll($uri){
+    $all=@(); $next=$uri
+    while($next){
+      $r = GetJson $next
+      if($r.value){ $all += $r.value }
+      $next = $r.'@odata.nextLink'
+    }
+    $all
+  }
+
+  # Permission lookup
+  $perms = GetAll ("/v1.0/drives/{0}/items/{1}/permissions" -f $using:drive.id, $_.Id)
+  $inherits = -not ($perms -and $perms.Count -gt 0)
+
+  if ($_.Type -eq 'Folder') {
+    if ($inherits) {
+      # include folders even if inherited
+      $rows.Add([pscustomobject]@{ SiteUrl=$using:SiteUrl; Library=$using:LibraryTitle; ItemType='Folder'; Path=$_.Path;
+                                   InheritsPermissions=$true; PrincipalName=''; PrincipalLogin=''; PrincipalType=''; Roles='' })
+    } else {
+      if ($perms.Count -eq 0) {
+        $rows.Add([pscustomobject]@{ SiteUrl=$using:SiteUrl; Library=$using:LibraryTitle; ItemType='Folder'; Path=$_.Path;
+                                     InheritsPermissions=$false; PrincipalName=''; PrincipalLogin=''; PrincipalType=''; Roles='' })
+      } else {
+        foreach($p in $perms){
+          $who=$null;$login=$null;$ptype=$null
+          if ($p.grantedToV2.user)         { $who=$p.grantedToV2.user.displayName;      $login=$p.grantedToV2.user.email;          $ptype='User' }
+          elseif ($p.grantedToV2.group)    { $who=$p.grantedToV2.group.displayName;     $login=$p.grantedToV2.group.id;            $ptype='Group' }
+          elseif ($p.grantedToV2.siteGroup){ $who=$p.grantedToV2.siteGroup.displayName; $login=$p.grantedToV2.siteGroup.loginName; $ptype='SharePointGroup' }
+          elseif ($p.grantedTo.user)       { $who=$p.grantedTo.user.displayName;        $login=$p.grantedTo.user.email;            $ptype='User' }
+          elseif ($p.grantedTo)            { $who=$p.grantedTo.displayName;             $ptype='Principal' }
+          $roles = ($p.roles) -join '; '
+          $rows.Add([pscustomobject]@{ SiteUrl=$using:SiteUrl; Library=$using:LibraryTitle; ItemType='Folder'; Path=$_.Path;
+                                       InheritsPermissions=$false; PrincipalName=$who; PrincipalLogin=$login; PrincipalType=$ptype; Roles=$roles })
+        }
+      }
+    }
+  } else {
+    # FILES: include ONLY if explicit perms exist
+    if (-not $inherits) {
+      if ($perms.Count -eq 0) {
+        $rows.Add([pscustomobject]@{ SiteUrl=$using:SiteUrl; Library=$using:LibraryTitle; ItemType='File'; Path=$_.Path;
+                                     InheritsPermissions=$false; PrincipalName=''; PrincipalLogin=''; PrincipalType=''; Roles='' })
+      } else {
+        foreach($p in $perms){
+          $who=$null;$login=$null;$ptype=$null
+          if ($p.grantedToV2.user)         { $who=$p.grantedToV2.user.displayName;      $login=$p.grantedToV2.user.email;          $ptype='User' }
+          elseif ($p.grantedToV2.group)    { $who=$p.grantedToV2.group.displayName;     $login=$p.grantedToV2.group.id;            $ptype='Group' }
+          elseif ($p.grantedToV2.siteGroup){ $who=$p.grantedToV2.siteGroup.displayName; $login=$p.grantedToV2.siteGroup.loginName; $ptype='SharePointGroup' }
+          elseif ($p.grantedTo.user)       { $who=$p.grantedTo.user.displayName;        $login=$p.grantedTo.user.email;            $ptype='User' }
+          elseif ($p.grantedTo)            { $who=$p.grantedTo.displayName;             $ptype='Principal' }
+          $roles = ($p.roles) -join '; '
+          $rows.Add([pscustomobject]@{ SiteUrl=$using:SiteUrl; Library=$using:LibraryTitle; ItemType='File'; Path=$_.Path;
+                                       InheritsPermissions=$false; PrincipalName=$who; PrincipalLogin=$login; PrincipalType=$ptype; Roles=$roles })
+        }
+      }
+    }
+  }
+} -ThrottleLimit $throttle -ArgumentList $drive.id, $SiteUrl, $LibraryTitle, $MaxRows
+
+# ---- export ----
+$rows.ToArray() | Sort-Object ItemType, Path, PrincipalName | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+if(-not $Quiet){ Write-Host ("Done. {0} rows -> {1}" -f $rows.Count, $OutCsv) -ForegroundColor DarkCyan }
