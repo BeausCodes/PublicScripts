@@ -1,0 +1,70 @@
+# Define Office version and registry paths
+$officeVersion = "16.0"
+$regKeys = @(
+    "HKCU:\Software\Microsoft\Office\$officeVersion\Word\CustomSettings",
+    "HKCU:\Software\Microsoft\Office\$officeVersion\Excel\CustomSettings",
+    "HKCU:\Software\Microsoft\Office\$officeVersion\Common\MailSettings"
+)
+
+# Define template files
+$normalPath = "$env:APPDATA\Microsoft\Templates\normal.dotm"
+$bookPath   = "$env:APPDATA\Microsoft\Excel\XLSTART\Book.xltm"
+
+# Track success
+$fileRemoved = $false
+
+# Try removing normal.dotm
+if (Test-Path $normalPath) {
+    try {
+        Remove-Item $normalPath -Force
+        Write-Output "✅ Removed template: $normalPath"
+        $fileRemoved = $true
+    } catch {
+        Write-Warning "⚠️ Failed to remove $normalPath : $_"
+    }
+} else {
+    Write-Output "ℹ️ normal.dotm not found at $normalPath"
+}
+
+# Try removing Book.xltm
+if (Test-Path $bookPath) {
+    try {
+        Remove-Item $bookPath -Force
+        Write-Output "✅ Removed template: $bookPath"
+        $fileRemoved = $true
+    } catch {
+        Write-Warning "⚠️ Failed to remove $bookPath : $_"
+    }
+} else {
+    Write-Output "ℹ️ Book.xltm not found at $bookPath"
+}
+
+# Only clear registry if any file was successfully removed
+if ($fileRemoved) {
+    Write-Output "🧹 Template(s) removed — proceeding with registry cleanup..."
+
+    foreach ($key in $regKeys) {
+        try {
+            if (Test-Path $key) {
+                # Remove the specific value
+                Remove-ItemProperty -Path $key -Name "ManagedIntuneFont" -ErrorAction SilentlyContinue
+                Write-Output "✅ Removed 'ManagedIntuneFont' from $key"
+
+                # Remove the key if empty
+                $remainingProps = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue | Get-Member -MemberType NoteProperty
+                if (-not $remainingProps -or $remainingProps.Count -eq 0) {
+                    Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
+                    Write-Output "🧹 Removed empty registry key: $key"
+                } else {
+                    Write-Output "ℹ️ Key $key still contains other values — not removed."
+                }
+            } else {
+                Write-Output "ℹ️ Registry path not found: $key"
+            }
+        } catch {
+            Write-Warning "⚠️ Failed to clean registry key $key : $_"
+        }
+    }
+} else {
+    Write-Output "ℹ️ No templates were removed — skipping registry cleanup."
+}
