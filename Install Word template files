@@ -1,0 +1,147 @@
+# ===============================
+# Font Template Deployment Script
+# ===============================
+
+# -------------------------------
+# Setup logging to C:\Temp
+# -------------------------------
+$logFolder = "C:\Temp"
+$logFile = Join-Path $logFolder "FontDeployment.log"
+
+if (-not (Test-Path $logFolder)) {
+    New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+}
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp :: $Message"
+    Write-Output $entry
+    Add-Content -Path $logFile -Value $entry
+}
+
+Write-Log "=== Starting Font Deployment Script ==="
+
+# -------------------------------
+# Get script root path
+# -------------------------------
+$scriptPath = $PSScriptRoot
+
+# -------------------------------
+# Define source file paths
+# -------------------------------
+$normalDotmSource      = Join-Path $scriptPath "normal.dotm"
+$normalEmailDotmSource = Join-Path $scriptPath "normalemail.dotm"
+$bookXltmSource        = Join-Path $scriptPath "Book.xltm"
+$regFilePath           = Join-Path $scriptPath "RegKey.reg"
+
+# -------------------------------
+# Define destination paths
+# -------------------------------
+$userTemplatesPath = "$env:APPDATA\Microsoft\Templates"
+$excelStartupPath  = "$env:APPDATA\Microsoft\Excel\XLSTART"
+
+# Create destination folders if needed
+New-Item -ItemType Directory -Force -Path $userTemplatesPath | Out-Null
+New-Item -ItemType Directory -Force -Path $excelStartupPath  | Out-Null
+
+# -------------------------------
+# Copy template files
+# -------------------------------
+$templateCopySuccess = $true
+
+# normal.dotm
+if (-not (Test-Path $normalDotmSource)) {
+    Write-Log "❌ normal.dotm not found at: $normalDotmSource"
+    $templateCopySuccess = $false
+} else {
+    try {
+        Copy-Item -Path $normalDotmSource -Destination "$userTemplatesPath\normal.dotm" -Force -ErrorAction Stop
+        Write-Log "✅ Copied normal.dotm"
+    } catch {
+        Write-Log "❌ Failed to copy normal.dotm: $_"
+        $templateCopySuccess = $false
+    }
+}
+
+# normalemail.dotm
+if (-not (Test-Path $normalEmailDotmSource)) {
+    Write-Log "❌ normalemail.dotm not found at: $normalEmailDotmSource"
+    $templateCopySuccess = $false
+} else {
+    try {
+        Copy-Item -Path $normalEmailDotmSource -Destination "$userTemplatesPath\normalemail.dotm" -Force -ErrorAction Stop
+        Write-Log "✅ Copied normalemail.dotm"
+    } catch {
+        Write-Log "❌ Failed to copy normalemail.dotm: $_"
+        $templateCopySuccess = $false
+    }
+}
+
+# Book.xltm
+if (-not (Test-Path $bookXltmSource)) {
+    Write-Log "❌ Book.xltm not found at: $bookXltmSource"
+    $templateCopySuccess = $false
+} else {
+    try {
+        Copy-Item -Path $bookXltmSource -Destination "$excelStartupPath\Book.xltm" -Force -ErrorAction Stop
+        Write-Log "✅ Copied Book.xltm"
+    } catch {
+        Write-Log "❌ Failed to copy Book.xltm: $_"
+        $templateCopySuccess = $false
+    }
+}
+
+# -------------------------------
+# Import RegKey.reg
+# -------------------------------
+$regImportSuccess = $true
+
+if (-not (Test-Path $regFilePath)) {
+    Write-Log "❌ RegKey.reg not found at: $regFilePath"
+    $regImportSuccess = $false
+} else {
+    try {
+        $null = & reg import $regFilePath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "❌ reg import failed (exit code $LASTEXITCODE)"
+            $regImportSuccess = $false
+        } else {
+            Write-Log "✅ RegKey.reg imported"
+        }
+    } catch {
+        Write-Log "❌ Exception during reg import: $_"
+        $regImportSuccess = $false
+    }
+}
+
+# -------------------------------
+# Set Registry Keys (Only if success)
+# -------------------------------
+if ($templateCopySuccess -and $regImportSuccess) {
+    $officeVersion = "16.0"
+    $registryValue = "Ticket #1261306"
+
+    $wordRegPath  = "HKCU:\Software\Microsoft\Office\$officeVersion\Word\CustomSettings"
+    $excelRegPath = "HKCU:\Software\Microsoft\Office\$officeVersion\Excel\CustomSettings"
+    $mailRegPath  = "HKCU:\Software\Microsoft\Office\$officeVersion\Common\MailSettings"
+
+    try {
+        New-Item -Path $wordRegPath -Force | Out-Null
+        New-Item -Path $excelRegPath -Force | Out-Null
+        New-Item -Path $mailRegPath -Force | Out-Null
+
+        New-ItemProperty -Path $wordRegPath  -Name "ManagedIntuneFont" -Value $registryValue -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $excelRegPath -Name "ManagedIntuneFont" -Value $registryValue -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $mailRegPath  -Name "ManagedIntuneFont" -Value $registryValue -PropertyType String -Force | Out-Null
+
+        Write-Log "✅ Registry keys written with value '$registryValue'"
+    } catch {
+        Write-Log "❌ Failed to set registry keys: $_"
+    }
+} else {
+    Write-Log "⚠️ Skipping registry key creation due to earlier failures"
+}
+
+Write-Log "=== Script Complete ==="
+exit 0
