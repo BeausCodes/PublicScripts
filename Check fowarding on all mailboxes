@@ -1,1 +1,2 @@
+#This checks for all forwards set on all mailboxes in entire tenant
 Get-Mailbox | select UserPrincipalName,ForwardingSmtpAddress,DeliverToMailboxAndForward | Export-csv .\forwarders.csv -NoTypeInformation
