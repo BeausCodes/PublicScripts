@@ -1,0 +1,72 @@
+$ErrorActionPreference = 'Stop'
+
+# --- Paths ---
+$srcStartup   = Join-Path $env:USERPROFILE 'ZDD PTY LTD\ACP - Precedents\Installation Files\Startup'
+$srcTemplates = Join-Path $env:USERPROFILE 'ZDD PTY LTD\ACP - Precedents\Installation Files\Templates'
+$dstStartup   = Join-Path $env:APPDATA     'Microsoft\Word\STARTUP'
+$dstTemplates = Join-Path $env:APPDATA     'Microsoft\Templates'
+
+# --- Logging setup ---
+$logDir  = 'C:\Temp'
+$logFile = Join-Path $logDir 'WordSync.log'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    "$timestamp [$Level] $Message" | Tee-Object -FilePath $logFile -Append
+}
+
+Write-Log "=== Starting Word file sync process ==="
+
+function Sync-Folder {
+    param([string]$Source,[string]$Destination)
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        Write-Log "Source path missing: $Source. Skipping sync." "WARN"
+        return
+    }
+
+    Write-Log "Syncing from '$Source' to '$Destination'..."
+    try {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    } catch {
+        Write-Log "Failed to create destination folder $Destination. $_" "ERROR"
+        return
+    }
+
+    Get-ChildItem -LiteralPath $Source -File -Recurse | ForEach-Object {
+        $rel    = $_.FullName.Substring($Source.Length).TrimStart('\')
+        $target = Join-Path $Destination $rel
+
+        try {
+            New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+
+            $copy = $true
+            if (Test-Path -LiteralPath $target) {
+                try {
+                    $h1 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+                    $h2 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                    if ($h1 -eq $h2) { $copy = $false }
+                } catch {
+                    Write-Log "Hash comparison failed for $($_.FullName). $_" "WARN"
+                }
+            }
+
+            if ($copy) {
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+                Write-Log "Copied: $($_.FullName) â†’ $target"
+            } else {
+                Write-Log "Skipped (identical): $($_.FullName)"
+            }
+        } catch {
+            Write-Log "Error processing $($_.FullName): $_" "ERROR"
+        }
+    }
+    Write-Log "Completed syncing folder '$Source'."
+}
+
+Sync-Folder -Source $srcStartup   -Destination $dstStartup
+Sync-Folder -Source $srcTemplates -Destination $dstTemplates
+
+Write-Log "=== Word file sync completed successfully ==="
