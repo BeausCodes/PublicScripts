@@ -9,7 +9,7 @@ $IPs = 1..254 | ForEach-Object {
 Write-Host "Pinging entire subnet…"
 
 $Results = foreach ($IP in $IPs) {
-    $ping = Test-Connection -Count 1 -Quiet -TimeoutSeconds 0.2 -ComputerName $IP
+    $ping = Test-Connection -Count 1 -Quiet -ComputerName $IP
 
     if ($ping) {
         # Try reverse DNS
