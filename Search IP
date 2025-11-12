@@ -1,0 +1,29 @@
+# --- CONFIG ---
+# Change this to your subnet (CIDR /24 assumed)
+$Subnet = "192.168.1"
+
+$IPs = 1..254 | ForEach-Object {
+    "$Subnet.$_"
+}
+
+Write-Host "Pinging entire subnet…"
+
+$Results = foreach ($IP in $IPs) {
+    $ping = Test-Connection -Count 1 -Quiet -TimeoutSeconds 0.2 -ComputerName $IP
+
+    if ($ping) {
+        # Try reverse DNS
+        try {
+            $Hostname = [System.Net.Dns]::GetHostEntry($IP).HostName
+        } catch {
+            $Hostname = "<no-dns>"
+        }
+
+        [PSCustomObject]@{
+            IP       = $IP
+            Hostname = $Hostname
+        }
+    }
+}
+
+$Results | Format-Table
