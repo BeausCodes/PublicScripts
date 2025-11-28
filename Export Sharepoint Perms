@@ -1,0 +1,180 @@
+param(
+  [Parameter(Mandatory=$true)] [string]$SiteUrl,
+  [Parameter(Mandatory=$true)] [string]$LibraryTitle,   # e.g. "Documents" or "Shared Documents"
+  [string]$OutCsv = "$PWD\SP_FolderPerms_$(Get-Date -f 'yyyyMMdd_HHmmss').csv",
+  [string]$StartFolder = "",
+  [int]$MaxDepth = 3,                                   # only go 3 levels deep
+  [int]$Concurrency = 8,
+  [switch]$Quiet
+)
+
+# ---- ensure Graph SDK is connected (interactive popup) ----
+try {
+  if (-not (Get-MgContext)) {
+    Connect-MgGraph -Scopes "Sites.Read.All" -NoWelcome
+  }
+} catch {
+  throw "Not connected to Microsoft Graph. Run: Connect-MgGraph -Scopes 'Sites.Read.All'"
+}
+
+function Log($m){ if(-not $Quiet){ Write-Host "[$(Get-Date -f HH:mm:ss)] $m" -ForegroundColor DarkCyan } }
+
+function Get-GraphJson([Parameter(Mandatory)][string]$Uri){
+  $attempt = 0
+  while ($true) {
+    try { return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop }
+    catch {
+      if (++$attempt -ge 5) { throw }
+      Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
+    }
+  }
+}
+function Get-AllPages([Parameter(Mandatory)][string]$Uri){
+  $all=@(); $next=$Uri
+  while($next){
+    $resp = Get-GraphJson $next
+    if($resp.value){ $all += $resp.value }
+    $next = $resp.'@odata.nextLink'
+  }
+  $all
+}
+
+# ---- quick probe ----
+Get-GraphJson "/v1.0/sites/root" | Out-Null
+
+# ---- resolve site ----
+$u        = [Uri]$SiteUrl
+$spHost   = $u.Host
+$sitePath = if ([string]::IsNullOrWhiteSpace($u.AbsolutePath)) { "/" } else { $u.AbsolutePath }
+$site     = Get-GraphJson ("/v1.0/sites/{0}:{1}" -f $spHost, $sitePath)
+if(-not $site.id){ throw "Could not resolve site from $SiteUrl" }
+Log ("Site: {0}" -f $site.id)
+
+# ---- resolve drive (library) ----
+$drives = Get-AllPages ("/v1.0/sites/{0}/drives" -f $site.id)
+$drive  = $drives | Where-Object { $_.name -eq $LibraryTitle } | Select-Object -First 1
+if(-not $drive){
+  $names = ($drives | Select-Object -ExpandProperty name) -join ', '
+  throw ("Library '{0}' not found at {1}. Available: {2}" -f $LibraryTitle,$SiteUrl,$names)
+}
+Log ("Library: {0} ({1})" -f $drive.name,$drive.id)
+
+# ---- locate start folder ----
+$rootItem = Get-GraphJson ("/v1.0/drives/{0}/root?`$select=id,name,parentReference" -f $drive.id)
+$startId  = $rootItem.id
+if ($StartFolder -and $StartFolder.Trim() -ne "") {
+  if (-not $StartFolder.StartsWith("/")) { $StartFolder = "/$StartFolder" }
+  $sf = $null
+  $sfPath = ("/v1.0/drives/{0}/root:{1}:" -f $drive.id, $StartFolder)
+  try { $sf = Get-GraphJson $sfPath } catch {}
+  if(-not $sf -or -not $sf.id){ throw "StartFolder '$StartFolder' not found in '$($drive.name)'." }
+  $startId = $sf.id
+  Log ("Start folder: {0}" -f $StartFolder)
+} else {
+  Log "Start at drive root"
+}
+
+# ---- 1) Crawl folders only (no files) ----
+$folders = New-Object System.Collections.Generic.List[object]
+
+function Enqueue-Folder([object]$it){
+  $prefix = $it.parentReference.path.Replace('/drive/root:', '')
+  $path   = if([string]::IsNullOrWhiteSpace($prefix)){ "/$($it.name)" } else { "$prefix/$($it.name)" }
+  $folders.Add([pscustomobject]@{ Id=$it.id; Path=$path })
+}
+
+function Walk-Folders([string]$ParentId,[int]$Depth){
+  if ($MaxDepth -ne 0 -and $Depth -gt $MaxDepth) { return }
+  $kids = Get-AllPages ("/v1.0/drives/{0}/items/{1}/children?`$select=id,name,folder,parentReference&`$top=200" -f $drive.id, $ParentId)
+  foreach ($f in ($kids | Where-Object { $_.folder })) {
+    Enqueue-Folder $f
+    Walk-Folders -ParentId $f.id -Depth ($Depth + 1)
+  }
+}
+
+Log ("Collecting folder tree… (MaxDepth={0})" -f $MaxDepth)
+Walk-Folders -ParentId $startId -Depth 1
+Log ("Collected {0} folders" -f $folders.Count)
+
+# ---- 2) Parallel fetch of folder /permissions ----
+$driveId       = $drive.id
+$siteUrlScalar = $SiteUrl
+$libTitleScalar= $LibraryTitle
+$throttle      = [Math]::Max(1, [Math]::Min($Concurrency, 32))
+Log ("Fetching permissions (folders only) with concurrency={0}…" -f $throttle)
+
+# IMPORTANT: do NOT mutate shared state; emit objects and collect them
+$results = $folders | ForEach-Object -Parallel {
+  param()
+
+  function GetJson($uri){
+    $attempt=0
+    while($true){
+      try{ return Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop }
+      catch{ if(++$attempt -ge 5){ throw }; Start-Sleep -Seconds ([Math]::Min(30,2*$attempt)) }
+    }
+  }
+  function GetAll($uri){
+    $all=@(); $next=$uri
+    while($next){
+      $r = GetJson $next
+      if($r.value){ $all += $r.value }
+      $next = $r.'@odata.nextLink'
+    }
+    return $all
+  }
+
+  $perms = GetAll ("/v1.0/drives/{0}/items/{1}/permissions" -f $using:driveId, $_.Id)
+  $inherits = -not ($perms -and $perms.Count -gt 0)
+
+  if ($inherits) {
+    [pscustomobject]@{
+      SiteUrl             = $using:siteUrlScalar
+      Library             = $using:libTitleScalar
+      Path                = $_.Path
+      InheritsPermissions = $true
+      PrincipalName       = ''
+      PrincipalLogin      = ''
+      PrincipalType       = ''
+      Roles               = ''
+    }
+  }
+  else {
+    if ($perms.Count -eq 0) {
+      [pscustomobject]@{
+        SiteUrl             = $using:siteUrlScalar
+        Library             = $using:libTitleScalar
+        Path                = $_.Path
+        InheritsPermissions = $false
+        PrincipalName       = ''
+        PrincipalLogin      = ''
+        PrincipalType       = ''
+        Roles               = ''
+      }
+    } else {
+      foreach($p in $perms){
+        $who=$null;$login=$null;$ptype=$null
+        if     ($p.grantedToV2.user)      { $who=$p.grantedToV2.user.displayName;      $login=$p.grantedToV2.user.email;          $ptype='User' }
+        elseif ($p.grantedToV2.group)     { $who=$p.grantedToV2.group.displayName;     $login=$p.grantedToV2.group.id;            $ptype='Group' }
+        elseif ($p.grantedToV2.siteGroup) { $who=$p.grantedToV2.siteGroup.displayName; $login=$p.grantedToV2.siteGroup.loginName; $ptype='SharePointGroup' }
+        elseif ($p.grantedTo.user)        { $who=$p.grantedTo.user.displayName;        $login=$p.grantedTo.user.email;            $ptype='User' }
+        elseif ($p.grantedTo)             { $who=$p.grantedTo.displayName;             $ptype='Principal' }
+        $roles = ($p.roles) -join '; '
+        [pscustomobject]@{
+          SiteUrl             = $using:siteUrlScalar
+          Library             = $using:libTitleScalar
+          Path                = $_.Path
+          InheritsPermissions = $false
+          PrincipalName       = $who
+          PrincipalLogin      = $login
+          PrincipalType       = $ptype
+          Roles               = $roles
+        }
+      }
+    }
+  }
+} -ThrottleLimit $throttle
+
+# ---- export ----
+$results | Sort-Object Path, PrincipalName | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+if(-not $Quiet){ Write-Host ("Done. {0} folder rows -> {1}" -f ($results | Measure-Object | Select-Object -ExpandProperty Count), $OutCsv) -ForegroundColor DarkCyan }
